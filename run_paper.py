@@ -1,23 +1,71 @@
-# run_demo_live.py
+# run_paper.py
 from __future__ import annotations
 
 import os
+import sys
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
-from bot.runner import TradingBot
-from bot.history_manager import Bar
-from bot.exchange.factory import create_exchange
-from storage.sqlite_store import SQLiteStore
+
+# --- ensure repo root is on PYTHONPATH (so "bot.*" works when running as script) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+
+def _load_env_file(path: str) -> None:
+    """
+    Minimal .env loader (no deps).
+    - KEY=VALUE
+    - ignores empty lines and comments (# ...)
+    - strips optional quotes
+    - does NOT override already-set environment variables
+    """
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f.readlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not k:
+                    continue
+                if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+                    v = v[1:-1]
+                if k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+# Load .env from repo root
+_load_env_file(os.path.join(BASE_DIR, ".env"))
+
+# Backward-compatible aliases (so your existing env names can work too)
+if os.getenv("INITIAL_BALANCE") and not os.getenv("DEMO_INITIAL_BALANCE"):
+    os.environ["DEMO_INITIAL_BALANCE"] = os.getenv("INITIAL_BALANCE", "")
+if os.getenv("TRADE_STAKE") and not os.getenv("DEMO_TRADE_STAKE"):
+    os.environ["DEMO_TRADE_STAKE"] = os.getenv("TRADE_STAKE", "")
 
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("demo_live")
+logger = logging.getLogger("paper_live")
+
+
+from bot.runner import TradingBot
+from bot.history_manager import Bar
+from bot.exchange.factory import create_exchange
 
 
 def utc_now_str() -> str:
@@ -73,42 +121,51 @@ def row_to_bar(symbol: str, per_min: int, r: List[float]) -> Bar:
     )
 
 
-def bar_to_candle_dict(bar: Bar, ts_ms: int) -> Dict[str, Any]:
-    return {
-        "ts_ms": int(ts_ms),
-        "dt": str(bar.datetime),
-        "open": float(bar.open),
-        "high": float(bar.high),
-        "low": float(bar.low),
-        "close": float(bar.close),
-        "volume": float(bar.volume),
-        "symbol": bar.ticker,
-        "per_min": int(bar.per),
-    }
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
 
 
 def main() -> None:
     symbol = (os.getenv("SYMBOL") or "BTC-USDT").strip()
     tf = (os.getenv("TF") or "1m").strip()
-    history_limit = int(os.getenv("HISTORY_LIMIT") or "300")
+    history_limit = _env_int("HISTORY_LIMIT", 300)
 
-    initial_balance = float(os.getenv("DEMO_INITIAL_BALANCE") or "2000")
-    trade_stake = float(os.getenv("DEMO_TRADE_STAKE") or str(initial_balance))
+    # Capital
+    total_deposit = _env_float("TOTAL_DEPOSIT", _env_float("DEMO_INITIAL_BALANCE", 2000.0))
+    initial_balance = _env_float("DEMO_INITIAL_BALANCE", 2000.0)
+    trade_stake = _env_float("DEMO_TRADE_STAKE", initial_balance)
 
-    db_path = (os.getenv("DB_PATH") or "data/tradingbot.db").strip()
-    tag = (os.getenv("DEMO_TAG") or "DEMO_LIVE").strip()
+    # ALWAYS ON (as requested)
+    enable_long = True
+    enable_short = True
 
-    close_lag_ms = int(os.getenv("CLOSE_LAG_MS") or "1500")
-    poll_sleep_sec = float(os.getenv("POLL_SLEEP_SEC") or "0.8")
-    error_sleep_sec = float(os.getenv("ERROR_SLEEP_SEC") or "3.0")
+    close_lag_ms = _env_int("CLOSE_LAG_MS", 1500)
+    poll_sleep_sec = _env_float("POLL_SLEEP_SEC", 0.8)
+    error_sleep_sec = _env_float("ERROR_SLEEP_SEC", 3.0)
 
     per_min = tf_to_minutes(tf)
     tf_ms = per_min * 60 * 1000
 
-    logger.info("HEARTBEAT | starting DEMO (live candles, paper trades)")
+    logger.info("HEARTBEAT | starting PAPER bot (no DB) | LONG+SHORT enabled")
     logger.info(
-        "Config | symbol=%s tf=%s history_limit=%s initial_balance=%.2f trade_stake=%.2f db=%s",
-        symbol, tf, history_limit, initial_balance, trade_stake, db_path,
+        "Config | symbol=%s tf=%s history_limit=%s total_deposit=%.2f initial_balance=%.2f stake=%.2f",
+        symbol, tf, history_limit, total_deposit, initial_balance, trade_stake
     )
 
     exchange = create_exchange(os.getenv("EXCHANGE") or "OKX")
@@ -116,36 +173,19 @@ def main() -> None:
     ping_ok, ping_msg = exchange.api_ping()
     if not ping_ok:
         logger.error("ERROR | exchange api_ping failed: %s", ping_msg)
-    else:
-        logger.info("HEARTBEAT | exchange=%s ping=%s", getattr(exchange, "name", "?"), ping_msg)
+        return
+    logger.info("HEARTBEAT | exchange=%s ping=%s", getattr(exchange, "name", "?"), ping_msg)
 
     bot = TradingBot(
-        total_deposit=initial_balance,
+        total_deposit=total_deposit,
         trade_stake=trade_stake,
-        enable_long=True,
-        enable_short=False,
+        enable_long=enable_long,
+        enable_short=enable_short,
     )
     bot.reset_journals()
 
-    store = SQLiteStore(db_path)
-    session_id = store.start_live_session(
-        exchange=str(getattr(exchange, "name", "UNKNOWN")),
-        symbol=symbol,
-        timeframe=tf,
-        initial_balance=initial_balance,
-        trade_stake=trade_stake,
-        tag=tag,
-        meta={
-            "started_at": utc_now_str(),
-            "mode": "DEMO_PAPER",
-            "notes": "No real orders. Demo position simulation only.",
-        },
-    )
-    logger.info("HEARTBEAT | DB session started | session_id=%s", session_id)
-
     last_closed_ts: Optional[int] = None
     bar_index = -1
-    last_saved_trade_count = 0
 
     logger.info("HEARTBEAT | loop started (Ctrl+C to stop)")
 
@@ -182,11 +222,12 @@ def main() -> None:
                 bar_index += 1
                 bar = row_to_bar(symbol, per_min, last_closed)
 
-                logger.info("HEARTBEAT | new closed bar | %s | close=%.2f", bar.datetime, bar.close)
+                logger.info("CANDLE | %s | close=%.2f", bar.datetime, bar.close)
 
                 bars_rows_sorted = sorted(rows, key=lambda r: int(r[0]))
                 bars = [row_to_bar(symbol, per_min, r) for r in bars_rows_sorted]
 
+                # Indicators
                 try:
                     bot.prepare_indicators(bars)
                     df = bot.df
@@ -195,10 +236,11 @@ def main() -> None:
                     time.sleep(error_sleep_sec)
                     continue
 
-                # ---- build indicator snapshot for strategy (NO pandas inside strategy) ----
+                # Snapshot for strategies
                 macd = macd_signal = atr = None
                 bb_mid_seq = []
                 bb_upper_seq = []
+                bb_lower_seq = []
                 psar = None
 
                 try:
@@ -209,40 +251,66 @@ def main() -> None:
                         atr = last.get("atr")
                         psar = last.get("psar")
 
-                        # last (lookback+1) values for BB (oldest->newest)
                         lb = int(getattr(bot.strategy_long, "bb_lookback", 4))
                         n = lb + 1
                         bb_mid_seq = df["bb_mid"].iloc[-n:].tolist() if "bb_mid" in df.columns else []
                         bb_upper_seq = df["bb_upper"].iloc[-n:].tolist() if "bb_upper" in df.columns else []
+                        bb_lower_seq = df["bb_lower"].iloc[-n:].tolist() if "bb_lower" in df.columns else []
                 except Exception:
                     macd = macd_signal = atr = psar = None
                     bb_mid_seq = []
                     bb_upper_seq = []
+                    bb_lower_seq = []
 
-                # Strategy signal
-                signal = None
+                # Signals
+                signal_long = None
+                signal_short = None
+
+                # LONG
                 try:
-                    if bot.enable_long:
-                        from bot.strategy_long import IndicatorsSnap as LongSnap
-                        snap = LongSnap(
+                    from bot.strategy_long import IndicatorsSnap as LongSnap
+                    snap_l = LongSnap(
+                        macd=float(macd) if macd is not None else None,
+                        macd_signal=float(macd_signal) if macd_signal is not None else None,
+                        bb_mid_seq=bb_mid_seq,
+                        bb_upper_seq=bb_upper_seq,
+                        atr=float(atr) if atr is not None else None,
+                    )
+                    signal_long = bot.strategy_long.on_bar(bar, indicators=snap_l, bar_index=bar_index)
+                except Exception as e:
+                    logger.exception("ERROR | strategy_long.on_bar failed: %s", e)
+                    signal_long = None
+
+                # SHORT
+                try:
+                    from bot.strategy_short import IndicatorsSnap as ShortSnap
+                    try:
+                        snap_s = ShortSnap(
                             macd=float(macd) if macd is not None else None,
                             macd_signal=float(macd_signal) if macd_signal is not None else None,
                             bb_mid_seq=bb_mid_seq,
-                            bb_upper_seq=bb_upper_seq,
+                            bb_lower_seq=bb_lower_seq,
                             atr=float(atr) if atr is not None else None,
                         )
-                        signal = bot.strategy_long.on_bar(bar, indicators=snap, bar_index=bar_index)
+                    except TypeError:
+                        snap_s = ShortSnap(
+                            macd=float(macd) if macd is not None else None,
+                            macd_signal=float(macd_signal) if macd_signal is not None else None,
+                            bb_mid_seq=bb_mid_seq,
+                            atr=float(atr) if atr is not None else None,
+                        )
+                    signal_short = bot.strategy_short.on_bar(bar, indicators=snap_s, bar_index=bar_index)
                 except Exception as e:
-                    logger.exception("ERROR | strategy_long.on_bar failed: %s", e)
-                    signal = None
+                    logger.exception("ERROR | strategy_short.on_bar failed: %s", e)
+                    signal_short = None
 
-                # Trailing SL update (if in position)
+                # Trailing SL update
                 try:
                     if bot.risk.in_position and atr is not None:
                         bot.risk.update_sl_with_sar(
                             current_price=bar.close,
                             atr=float(atr),
-                            psar=float(psar) if psar is not None else None
+                            psar=float(psar) if psar is not None else None,
                         )
                 except Exception as e:
                     logger.exception("ERROR | update_sl_with_sar failed: %s", e)
@@ -267,55 +335,69 @@ def main() -> None:
                 except Exception as e:
                     logger.exception("ERROR | exit flow failed: %s", e)
 
-                # Entry (DEMO/PAPER)
+                # Entry (paper)
                 try:
-                    if (not bot.risk.in_position) and signal == "FULL_LONG":
-                        if atr is None or float(atr) <= 0:
-                            logger.info("ENTRY | skipped (ATR not ready)")
-                        else:
-                            bot.risk.enter_partial_long(entry_price=bar.close, atr=float(atr))
-                            bot.risk.add_full_long(entry_price=bar.close, atr=float(atr))
+                    if not bot.risk.in_position:
+                        if signal_long == "FULL_LONG":
+                            if atr is None or float(atr) <= 0:
+                                logger.info("ENTRY | LONG skipped (ATR not ready)")
+                            else:
+                                bot.risk.enter_partial_long(entry_price=bar.close, atr=float(atr))
+                                bot.risk.add_full_long(entry_price=bar.close, atr=float(atr))
+                                bot.snapshot_entry_ctx(
+                                    bar_dt=bar.datetime,
+                                    side="LONG",
+                                    entry_price=bar.close,
+                                    signal=signal_long,
+                                    entry_bar_index=bar_index,
+                                )
+                                logger.info(
+                                    "ENTRY | side=LONG signal=%s price=%.2f tp=%s sl=%s units=%.6f stake=%.2f equity=%.2f",
+                                    signal_long,
+                                    bar.close,
+                                    f"{bot.risk.tp_price:.2f}" if bot.risk.tp_price else None,
+                                    f"{bot.risk.sl_price:.2f}" if bot.risk.sl_price else None,
+                                    bot.risk.position_units,
+                                    bot.risk.trade_stake,
+                                    bot.get_equity_now(),
+                                )
 
-                            bot.snapshot_entry_ctx(
-                                bar_dt=bar.datetime,
-                                side="LONG",
-                                entry_price=bar.close,
-                                signal=signal,
-                                entry_bar_index=bar_index,
-                            )
-
-                            logger.info(
-                                "ENTRY | side=LONG signal=%s price=%.2f tp=%s sl=%s units=%.6f stake=%.2f equity=%.2f",
-                                signal,
-                                bar.close,
-                                f"{bot.risk.tp_price:.2f}" if bot.risk.tp_price else None,
-                                f"{bot.risk.sl_price:.2f}" if bot.risk.sl_price else None,
-                                bot.risk.position_units,
-                                bot.risk.trade_stake,
-                                bot.get_equity_now(),
-                            )
+                        elif signal_short in ("FULL_SHORT", "SHORT", "FULL_SHORT_SIGNAL"):
+                            if atr is None or float(atr) <= 0:
+                                logger.info("ENTRY | SHORT skipped (ATR not ready)")
+                            else:
+                                # Your build may be long-only in risk manager; we log if short methods absent
+                                try:
+                                    bot.risk.enter_partial_short(entry_price=bar.close, atr=float(atr))
+                                    bot.risk.add_full_short(entry_price=bar.close, atr=float(atr))
+                                except AttributeError:
+                                    logger.warning("ENTRY | SHORT signal but risk manager has no short methods (long-only build)")
+                                else:
+                                    bot.snapshot_entry_ctx(
+                                        bar_dt=bar.datetime,
+                                        side="SHORT",
+                                        entry_price=bar.close,
+                                        signal=str(signal_short),
+                                        entry_bar_index=bar_index,
+                                    )
+                                    logger.info(
+                                        "ENTRY | side=SHORT signal=%s price=%.2f tp=%s sl=%s units=%.6f stake=%.2f equity=%.2f",
+                                        signal_short,
+                                        bar.close,
+                                        f"{bot.risk.tp_price:.2f}" if bot.risk.tp_price else None,
+                                        f"{bot.risk.sl_price:.2f}" if bot.risk.sl_price else None,
+                                        bot.risk.position_units,
+                                        bot.risk.trade_stake,
+                                        bot.get_equity_now(),
+                                    )
                 except Exception as e:
                     logger.exception("ERROR | entry flow failed: %s", e)
 
-                # Equity point
+                # Equity point (in-memory only)
                 try:
                     bot.record_equity_point(bar.datetime)
                 except Exception:
                     pass
-
-                # DB writes
-                try:
-                    store.insert_live_candle(session_id, bar_to_candle_dict(bar, ts_ms=ts))
-                    store.insert_live_equity(session_id, bar.datetime, bot.get_equity_now())
-
-                    if len(bot.trades_log) > last_saved_trade_count:
-                        for idx in range(last_saved_trade_count, len(bot.trades_log)):
-                            t = dict(bot.trades_log[idx])
-                            store.insert_live_trade(session_id, idx=idx, trade=t)
-                        last_saved_trade_count = len(bot.trades_log)
-
-                except Exception as e:
-                    logger.warning("ERROR | DB write failed: %s", e)
 
                 time.sleep(0.2)
 
@@ -328,13 +410,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("HEARTBEAT | stopped by user (Ctrl+C)")
     finally:
-        try:
-            store.stop_live_session(session_id)
-        except Exception:
-            pass
-
-        logger.info("Summary | session_id=%s trades=%d equity=%.2f",
-                    session_id, len(bot.trades_log), bot.get_equity_now())
+        logger.info("Summary | trades=%d equity=%.2f", len(getattr(bot, "trades_log", [])), bot.get_equity_now())
 
 
 if __name__ == "__main__":
